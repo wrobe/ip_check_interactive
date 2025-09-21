@@ -6,21 +6,23 @@ Interactive SOC helper:
 - Asks for an IP (IPv4/IPv6)
 - VirusTotal: malicious engine count
 - AbuseIPDB: reports + confidence score
-- IPinfo: city, country (and anonymity flags for fallback)
-- IP2Proxy: proxy/VPN detection (uses IPinfo anonymity as fallback)
+- IPinfo: city, country (Plus API 'lookup' first, legacy fallback if needed)
+- IP2Proxy: proxy/VPN detection (uses IPinfo privacy flags as fallback)
 - Prints your requested one-line sentence + a short breakdown
 
 Setup:
   pip install requests python-dotenv
   (Optionally create a .env with VT_API_KEY, ABUSEIPDB_API_KEY, IPINFO_TOKEN, IP2PROXY_API_KEY)
 
-Author: Krzysztof Wróbel 
+Author: Krzysztof Wróbel
 """
 
 from __future__ import annotations
+
 import os
 import sys
 import time
+import random
 import ipaddress
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
@@ -32,7 +34,6 @@ try:
     load_dotenv(dotenv_path=env_path, override=True)
 except Exception:
     pass  # Script will still work if dotenv isn't installed
-
 
 import requests
 
@@ -59,11 +60,20 @@ def http_get_json(url: str,
                   headers: Optional[Dict[str, str]] = None,
                   params: Optional[Dict[str, Any]] = None,
                   timeout: int = TIMEOUT) -> Optional[dict]:
-    """GET JSON with simple exponential backoff on rate-limit/server errors."""
+    """
+    GET JSON with exponential backoff on 429/5xx, honoring Retry-After, with jitter.
+    Returns dict on success, None otherwise.
+    """
     delay = 1.5
+    base_headers = {
+        "User-Agent": "kw-soc-ip-check/1.1 (+https://example.internal)",
+        "Accept": "application/json",
+    }
+
     for _ in range(5):
         try:
-            r = requests.get(url, headers=headers or {}, params=params or {}, timeout=timeout)
+            h = {**base_headers, **(headers or {})}
+            r = requests.get(url, headers=h, params=params or {}, timeout=timeout)
         except requests.RequestException as e:
             sys.stderr.write(f"[!] HTTP error calling {url}: {e}\n")
             time.sleep(delay)
@@ -77,12 +87,21 @@ def http_get_json(url: str,
                 sys.stderr.write(f"[!] Non-JSON response from {url}\n")
                 return None
 
+        # If it's not retryable, log and stop
         if r.status_code not in RETRY_STATUS:
-            sys.stderr.write(f"[!] {url} -> HTTP {r.status_code}: {r.text[:200]}\n")
+            snippet = r.text[:200].replace("\n", " ")
+            sys.stderr.write(f"[!] {url} -> HTTP {r.status_code}: {snippet}\n")
             return None
 
-        # Retry on 429/5xx
-        time.sleep(delay)
+        # Retry on 429/5xx; honor Retry-After when present
+        sleep_for = delay
+        ra = r.headers.get("Retry-After")
+        if ra:
+            try:
+                sleep_for = max(float(ra), delay)
+            except ValueError:
+                pass
+        time.sleep(sleep_for + random.uniform(0, 0.5))
         delay *= 2
 
     sys.stderr.write(f"[!] {url} -> giving up after retries.\n")
@@ -91,74 +110,88 @@ def http_get_json(url: str,
 
 # ------------ Provider Integrations ------------
 
-def vt_malicious_count(ip: str, api_key: str) -> int:
+def vt_malicious_count(ip: str, api_key: str) -> Optional[int]:
     """
     VirusTotal v3 IP report: https://www.virustotal.com/api/v3/ip_addresses/{ip}
-    We read attributes.last_analysis_stats.malicious
+    Reads attributes.last_analysis_stats.malicious (Optional[int]).
     """
     if not api_key:
-        return 0
+        return None
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     headers = {"x-apikey": api_key, "accept": "application/json"}
     data = http_get_json(url, headers=headers)
     if not data:
-        return 0
+        return None
     try:
         stats = data["data"]["attributes"]["last_analysis_stats"]
         return int(stats.get("malicious", 0))
     except Exception:
-        return 0
+        return None
 
 
-def abuseipdb_reports_and_score(ip: str, api_key: str, max_age_days: int = 90) -> Tuple[int, int]:
+def abuseipdb_reports_and_score(ip: str, api_key: str, max_age_days: int = 90) -> Tuple[Optional[int], Optional[int]]:
     """
-    AbuseIPDB v2 CHECK endpoint:
-    GET https://api.abuseipdb.com/api/v2/check?ipAddress=...&maxAgeInDays=90&verbose
-    Returns (totalReports, abuseConfidenceScore)
+    AbuseIPDB v2 CHECK:
+      GET https://api.abuseipdb.com/api/v2/check?ipAddress=...&maxAgeInDays=...&verbose
+    Returns (totalReports, abuseConfidenceScore) as Optional[int] values.
     """
     if not api_key:
-        return (0, 0)
+        return (None, None)
     url = "https://api.abuseipdb.com/api/v2/check"
     headers = {"Key": api_key, "Accept": "application/json"}
-    params = {"ipAddress": ip, "maxAgeInDays": str(max_age_days), "verbose": ""}
+    # The docs present 'verbose' as a flag; 'true' is widely accepted.
+    params = {"ipAddress": ip, "maxAgeInDays": str(max_age_days), "verbose": "true"}
     data = http_get_json(url, headers=headers, params=params)
     if not data:
-        return (0, 0)
+        return (None, None)
     try:
         d = data["data"]
         total = int(d.get("totalReports", 0))
         score = int(d.get("abuseConfidenceScore", 0))
         return (total, score)
     except Exception:
-        return (0, 0)
+        return (None, None)
 
 
 def ipinfo_lookup(ip: str, token: str) -> Tuple[str, str, Dict[str, Any]]:
     """
-    IPinfo Core lookup:
-      - Preferred (new) schema: {"geo": {"city": "...", "country": "..."}, ...}
-      - Fallback to legacy flat fields if needed.
-    Returns (city, country, raw_json_for_flags)
+    IPinfo:
+      1) Try Plus 'lookup' endpoint (new schema with 'geo' + privacy fields).
+      2) If not entitled (403) or fails, fall back to legacy endpoint.
+    Returns (city, country, raw_json).
     """
     if not token:
         return ("", "", {})
-    url = f"https://api.ipinfo.io/lookup/{ip}"
-    params = {"token": token}
-    data = http_get_json(url, params=params) or {}
+
+    # Try Plus API first
+    url_plus = f"https://api.ipinfo.io/lookup/{ip}"
+    data = http_get_json(url_plus, params={"token": token})
+
+    # Fallback to legacy/standard endpoint if Plus is unavailable
+    if not data:
+        url_std = f"https://ipinfo.io/{ip}"
+        data = http_get_json(url_std, params={"token": token}) or {}
+
+    # Extract city/country from either Plus 'geo' object or legacy flat fields
     city = ""
     country = ""
     try:
-        geo = data.get("geo", {})
-        city = geo.get("city", "") or data.get("city", "")
-        country = geo.get("country", "") or data.get("country", "")
+        geo = data.get("geo", {}) if isinstance(data, dict) else {}
+        if isinstance(geo, dict):
+            city = geo.get("city", "") or data.get("city", "")
+            country = geo.get("country", "") or data.get("country", "")
+        else:
+            city = data.get("city", "")
+            country = data.get("country", "")
     except Exception:
         pass
+
     return (city or "", country or "", data)
 
 
 def ip2proxy_check(ip: str, api_key: str) -> Tuple[bool, str, str, bool]:
     """
-    IP2Proxy Web Service:
+    IP2Proxy Web Service (PX11 JSON):
       https://api.ip2proxy.com/?key=...&ip=...&package=PX11&format=json
     Returns (is_proxy, proxy_type, provider, used_ip2proxy)
     """
@@ -180,13 +213,20 @@ def ip2proxy_check(ip: str, api_key: str) -> Tuple[bool, str, str, bool]:
 
 def proxy_fallback_from_ipinfo(ipinfo_json: Dict[str, Any]) -> Tuple[bool, str, str]:
     """
-    If IP2Proxy is unavailable, use IPinfo flags:
-      - Treat is_anonymous=True as proxy/vpn
-      - We won’t have a provider; proxy_type set to 'Anonymous IP'
+    If IP2Proxy is unavailable, use IPinfo privacy flags when present:
+      - Treat any of {vpn, proxy, tor, relay} as anonymous.
+      - proxy_type reflects the first positive signal; provider populated if available.
     """
-    is_anon = bool(ipinfo_json.get("is_anonymous"))
-    proxy_type = "Anonymous IP" if is_anon else ""
-    provider = ""
+    anon = ipinfo_json.get("anonymous", {}) or {}
+    flags = {
+        "VPN": bool(anon.get("is_vpn")),
+        "Proxy": bool(anon.get("is_proxy")),
+        "Tor": bool(anon.get("is_tor")),
+        "Relay": bool(anon.get("is_relay")),
+    }
+    is_anon = any(flags.values()) or bool(ipinfo_json.get("is_anonymous"))
+    proxy_type = next((k for k, v in flags.items() if v), "Anonymous IP") if is_anon else ""
+    provider = (anon.get("name") or "").strip()
     return (is_anon, proxy_type, provider)
 
 
@@ -195,28 +235,39 @@ def proxy_fallback_from_ipinfo(ipinfo_json: Dict[str, Any]) -> Tuple[bool, str, 
 def final_sentence(ip: str,
                    city: str,
                    country: str,
-                   vt_count: int,
-                   abuse_total: int,
-                   abuse_score: int,
-                   is_proxy: bool,
+                   vt_count: Optional[int],
+                   abuse_total: Optional[int],
+                   abuse_score: Optional[int],
+                   is_proxy: Optional[bool],
                    proxy_type: str,
                    provider: str) -> str:
     """
-    Compose:
-    IP {IP} mapped {City Country} has/has not malicious reports from VirusTotal and {has/has not} malicious reports
-    from AbuseIPDB and belongs/does not belong to proxy/vpn provider (type/provider).
+    Compose a single line. If a source wasn't checked, avoid implying "clean".
     """
     location = f"{city}, {country}".strip(", ")
-    vt_phrase = "has" if vt_count > 0 else "has not"
-    abuse_phrase = "has" if (abuse_total > 0 or abuse_score > 0) else "has not"
-    proxy_phrase = "belongs to" if is_proxy else "does not belong to"
+    location = location or "-"
+
+    if vt_count is None:
+        vt_phrase = "was not checked"
+    else:
+        vt_phrase = "has" if vt_count > 0 else "has not"
+
+    if abuse_total is None or abuse_score is None:
+        abuse_phrase = "was not checked"
+    else:
+        abuse_phrase = "has" if (abuse_total > 0 or abuse_score > 0) else "has not"
+
+    if is_proxy is None:
+        proxy_phrase = "could not determine if it belongs to"
+    else:
+        proxy_phrase = "belongs to" if is_proxy else "does not belong to"
 
     extra = ""
     if is_proxy and (proxy_type or provider):
         details = ", ".join([v for v in [proxy_type, provider] if v])
         extra = f" ({details})"
 
-    return (f"IP {ip} mapped {location} "
+    return (f"IP {ip} mapped to {location} "
             f"{vt_phrase} malicious reports from VirusTotal and "
             f"{abuse_phrase} malicious reports from AbuseIPDB and "
             f"{proxy_phrase} proxy/vpn provider{extra}")
@@ -240,40 +291,62 @@ def process_ip(ip: str,
 
     # Lookups
     city, country, ipinfo_raw = ipinfo_lookup(ip, ipinfo_token)
-    vt_count = vt_malicious_count(ip, vt_key)
-    abuse_total, abuse_score = abuseipdb_reports_and_score(ip, abuse_key)
+    vt_count = vt_malicious_count(ip, vt_key)                  # Optional[int]
+    abuse_total, abuse_score = abuseipdb_reports_and_score(ip, abuse_key)  # Optional[int], Optional[int]
 
     # IP2Proxy or fallback
-    is_proxy = False
+    is_proxy: Optional[bool] = None
     proxy_type = ""
     provider = ""
     used_ip2proxy = False
 
     if ip2proxy_key:
-        is_proxy, proxy_type, provider, used_ip2proxy = ip2proxy_check(ip, ip2proxy_key)
+        is_proxy_val, proxy_type, provider, used_ip2proxy = ip2proxy_check(ip, ip2proxy_key)
+        if used_ip2proxy:
+            is_proxy = is_proxy_val
 
     if not used_ip2proxy:
-        # Fallback via IPinfo anonymity flag
-        is_proxy, proxy_type, provider = proxy_fallback_from_ipinfo(ipinfo_raw)
+        # Fallback via IPinfo privacy flags, but only if we have IPinfo data
+        if ipinfo_raw:
+            is_proxy_val, proxy_type, provider = proxy_fallback_from_ipinfo(ipinfo_raw)
+            is_proxy = is_proxy_val
+        else:
+            # Could not determine proxy status at all
+            is_proxy = None
+            proxy_type = ""
+            provider = ""
 
     # Final sentence
     sentence = final_sentence(ip, city, country,
                               vt_count, abuse_total, abuse_score,
                               is_proxy, proxy_type, provider)
 
+    # Output helper
+    def fmt(x: Optional[int], reason: str) -> str:
+        return str(x) if x is not None else f"skipped ({reason})"
+
     # Output
     print("\n" + "=" * 80)
     print(sentence)
     print("-" * 80)
-    print(f"• VirusTotal malicious detections: {vt_count}")
-    print(f"• AbuseIPDB reports (last 90 days): {abuse_total}  | confidence score: {abuse_score}")
+    print(f"• VirusTotal malicious detections: {fmt(vt_count, 'no VT_API_KEY or error')}")
+    print("• AbuseIPDB reports (last 90 days): "
+          f"{fmt(abuse_total, 'no ABUSEIPDB_API_KEY or error')}  | "
+          f"confidence score: {abuse_score if abuse_score is not None else '-'}")
     print(f"• Location (IPinfo): City='{city or '-'}', Country='{country or '-'}'")
+
     if used_ip2proxy:
         print(f"• Proxy/VPN (IP2Proxy): {'YES' if is_proxy else 'NO'}"
               f"{' | type=' + proxy_type if proxy_type else ''}"
               f"{' | provider=' + provider if provider else ''}")
     else:
-        print(f"• Proxy/VPN (fallback via IPinfo is_anonymous): {'YES' if is_proxy else 'NO'}")
+        if not ipinfo_raw:
+            print("• Proxy/VPN (fallback): skipped (IPinfo unavailable)")
+        else:
+            print(f"• Proxy/VPN (fallback via IPinfo privacy): "
+                  f"{'YES' if is_proxy else 'NO'}"
+                  f"{' | type=' + proxy_type if proxy_type else ''}"
+                  f"{' | provider=' + provider if provider else ''}")
     print("=" * 80 + "\n")
 
 
